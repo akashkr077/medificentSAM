@@ -332,7 +332,7 @@ def infer_3D(img_npz_file: str, model):
 
 
 if __name__ == "__main__":
-    model = torch.load(args.model).to("cpu")
+    model = torch.load(args.model, map_location="cpu", weights_only=False).to("cpu")
 
     img_npz_files = sorted(glob(join(data_root, "**", "*.npz"), recursive=True))
     efficiency = OrderedDict()
