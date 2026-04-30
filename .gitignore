@@ -163,3 +163,5 @@ seno.tar.gz
 *.blob
 
 test_output
+test_outputs/
+test_input/
