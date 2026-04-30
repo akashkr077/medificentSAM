@@ -144,6 +144,13 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "--device",
+    type=str,
+    default="auto",
+    help="device to run inference on: auto, cpu, cuda, or mps",
+)
+
+parser.add_argument(
     "-png_save_dir",
     type=str,
     default="./overlay",
@@ -175,7 +182,25 @@ if save_overlay:
 transform_image = get_image_transform(long_side_length=512)
 
 
-def infer_2D(img_npz_file, model):
+def resolve_device(requested_device: str) -> torch.device:
+    if requested_device == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    device_type = requested_device.split(":", maxsplit=1)[0]
+    if device_type == "cuda" and not torch.cuda.is_available():
+        print("Requested CUDA, but it is unavailable. Falling back to CPU.")
+        return torch.device("cpu")
+    if device_type == "mps" and not torch.backends.mps.is_available():
+        print("Requested MPS, but it is unavailable. Falling back to CPU.")
+        return torch.device("cpu")
+    return torch.device(requested_device)
+
+
+def infer_2D(img_npz_file, model, device):
     npz_name = basename(img_npz_file)
     npz_data = np.load(img_npz_file, "r")
 
@@ -188,7 +213,7 @@ def infer_2D(img_npz_file, model):
         original_size[0], original_size[1], 512
     )
     tsfm_img = torch.tensor(np.transpose(img, (2, 0, 1)), dtype=torch.uint8)
-    tsfm_img = transform_image(tsfm_img.unsqueeze(0))
+    tsfm_img = transform_image(tsfm_img.unsqueeze(0)).to(device)
 
     boxes = npz_data["boxes"]
     tsfm_boxes = []
@@ -199,7 +224,7 @@ def infer_2D(img_npz_file, model):
             prompt_encoder_input_size=512,
         )
         tsfm_boxes.append(box)
-    tsfm_boxes = torch.tensor(np.array(tsfm_boxes), dtype=torch.float32)
+    tsfm_boxes = torch.tensor(np.array(tsfm_boxes), dtype=torch.float32, device=device)
 
     image_embedding = model.image_encoder(tsfm_img)
 
@@ -222,7 +247,7 @@ def infer_2D(img_npz_file, model):
         )
 
 
-def infer_3D(img_npz_file: str, model):
+def infer_3D(img_npz_file: str, model, device):
     prompt_encoder_input_size = model.prompt_encoder.input_image_size[0]
 
     npz_name = basename(img_npz_file)
@@ -241,7 +266,7 @@ def infer_3D(img_npz_file: str, model):
     new_size = ResizeLongestSide.get_preprocess_shape(
         original_size[0], original_size[1], 512
     )
-    tsfm_img_3D = transform_image(torch.tensor(tsfm_img_3D, dtype=torch.uint8))
+    tsfm_img_3D = transform_image(torch.tensor(tsfm_img_3D, dtype=torch.uint8)).to(device)
 
     tsfm_boxes = []
     for box3D in boxes:
@@ -254,7 +279,7 @@ def infer_3D(img_npz_file: str, model):
         )
         box3D = np.array([box2D[0], box2D[1], z_min, box2D[2], box2D[3], z_max])
         tsfm_boxes.append(box3D)
-    tsfm_boxes = torch.tensor(np.array(tsfm_boxes), dtype=torch.float32)
+    tsfm_boxes = torch.tensor(np.array(tsfm_boxes), dtype=torch.float32, device=device)
 
     segs = np.zeros_like(img_3D, dtype=np.uint8)
 
@@ -270,7 +295,7 @@ def infer_3D(img_npz_file: str, model):
             img_2d = tsfm_img_3D[z, :, :, :].unsqueeze(0)  # (1, 3, H, W)
             image_embedding = model.image_encoder(img_2d)  # (1, 256, 64, 64)
 
-            box_torch = torch.as_tensor(box_2D[None, ...], dtype=torch.float)  # (B, 4)
+            box_torch = torch.as_tensor(box_2D[None, ...], dtype=torch.float, device=device)  # (B, 4)
             mask, _ = model.prompt_and_decoder(image_embedding, box_torch)
             mask = model.postprocess_masks(mask, new_size, original_size)
             mask = mask.squeeze().cpu().numpy()
@@ -300,7 +325,7 @@ def infer_3D(img_npz_file: str, model):
             img_2d = tsfm_img_3D[z, :, :, :].unsqueeze(0)  # (1, 3, H, W)
             image_embedding = model.image_encoder(img_2d)  # (1, 256, 64, 64)
 
-            box_torch = torch.as_tensor(box_2D[None, ...], dtype=torch.float)  # (B, 4)
+            box_torch = torch.as_tensor(box_2D[None, ...], dtype=torch.float, device=device)  # (B, 4)
             mask, _ = model.prompt_and_decoder(image_embedding, box_torch)
             mask = model.postprocess_masks(mask, new_size, original_size)
             mask = mask.squeeze().cpu().numpy()
@@ -332,7 +357,10 @@ def infer_3D(img_npz_file: str, model):
 
 
 if __name__ == "__main__":
-    model = torch.load(args.model, map_location="cpu", weights_only=False).to("cpu")
+    device = resolve_device(args.device)
+    print(f"Using device: {device}")
+    model = torch.load(args.model, map_location="cpu", weights_only=False).to(device)
+    model.eval()
 
     img_npz_files = sorted(glob(join(data_root, "**", "*.npz"), recursive=True))
     efficiency = OrderedDict()
@@ -341,9 +369,9 @@ if __name__ == "__main__":
     for img_npz_file in tqdm(img_npz_files):
         start_time = time()
         if basename(img_npz_file).startswith("2D"):
-            infer_2D(img_npz_file, model)
+            infer_2D(img_npz_file, model, device)
         else:
-            infer_3D(img_npz_file, model)
+            infer_3D(img_npz_file, model, device)
         end_time = time()
         efficiency["case"].append(basename(img_npz_file))
         efficiency["time"].append(end_time - start_time)
